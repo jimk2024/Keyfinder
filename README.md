@@ -1,0 +1,347 @@
+# KeyFinder
+
+KeyFinder 是一个基于 **CUDA (GPU加速)** 的高性能比特币私钥碰撞/搜索工具。其主要功能是在指定的私钥范围内，通过暴力穷举的方式生成公钥和地址，并与目标地址进行比对，以寻找对应的比特币私钥。
+
+## 工作原理 (Workflow)
+
+该程序采用 **CPU 控制 + GPU 计算** 的异构计算模式来最大化效率。
+
+### 1. 初始化阶段 (CPU)
+*   **配置读取**: 程序读取用户配置，包括起始私钥、结束私钥以及目标地址列表。
+*   **地址转换**: 将目标地址（通常是 Base58 编码）解码并转换为 **Hash160** 格式（20字节的16进制数）。
+*   **数据传输**: 将目标 Hash160 数据上传到 GPU 的显存。为了加速查询，通常会构建高效的过滤器（如 Bloom 或 XOR Filter）并放置在高速缓存中。
+*   **任务分配**: 为每个 GPU 线程分配初始私钥和对应的公钥点。
+
+### 2. 并行搜索 (GPU Kernel)
+*   **大规模并行**: 启动成千上万个 GPU 线程同时运行。
+*   **状态维护**: 每个线程维护一个当前的公钥点 $P$。
+*   **迭代过程**:
+    1.  **哈希运算**: 在每一次迭代中，线程对当前公钥点进行双重哈希（SHA256 + RIPEMD160），生成地址 Hash。
+    2.  **快速比对**: 将生成的 Hash 与目标列表进行比对。
+    3.  **点加法优化**: 如果不匹配，线程将当前公钥点加上一个预计算的步长点 $G$（即 $P_{new} = P_{old} + G$），从而得到下一个私钥对应的公钥。这避免了昂贵的标量乘法运算。
+
+### 3. 结果回传
+*   一旦某个线程发现生成的 Hash 在目标列表中，它会将当前的私钥、公钥等信息写入结果缓冲区。
+*   CPU 定期检查结果缓冲区，如果有结果，则记录到文件或输出到控制台。
+
+---
+
+## 计算方法与数学原理
+
+为了在巨大的私钥空间中进行有效搜索，KeyFinder 运用了多种数学优化方法：
+
+### A. 椭圆曲线加密 (ECC - secp256k1)
+程序基于比特币使用的 **secp256k1** 椭圆曲线。
+*   **私钥 ($k$)**: 一个 256 位的随机整数。
+*   **公钥 ($P$)**: 曲线上的一个点。
+*   **核心优化**: 利用 **点加法 (Point Addition)** 来迭代公钥 ($P_{k+1} = P_k + G$)，而非每次进行标量乘法。同时采用了 **批量求逆 (Batch Inversion)** 技术，让一个线程块内的所有线程协同计算模逆元，大幅提高了吞吐量。
+
+### B. 地址生成 (Hashing)
+比特币地址的生成需要经过双重哈希：
+1.  **SHA-256**: 对公钥坐标进行 SHA-256 哈希。
+    $$H_1 = \text{SHA256}(PubKey)$$
+2.  **RIPEMD-160**: 对 $H_1$ 进行 RIPEMD-160 哈希。
+    $$H_2 = \text{RIPEMD160}(H_1)$$
+    *   $H_2$ 即为用于比对的目标值。
+
+### C. 查找与匹配 (Lookup)
+为了在 GPU 上快速判断生成的哈希是否是目标之一，程序使用了高效的数据结构：
+*   **Hash Lookup / Bloom Filter / XOR Filter**: 这些结构存储在 GPU 的高速缓存（Constant Memory 或 Texture Memory）中，以保证极高的读取带宽和查询速度。
+
+---
+
+## 代码结构
+
+主要模块及其功能如下：
+
+*   **`KeyFinder/main.cpp`**: 程序的入口，处理命令行参数，加载配置。
+*   **`KeyFinderLib/KeyFinder.cpp`**: 核心控制逻辑，负责调度 GPU 设备，管理搜索进度。
+*   **`CudaKeySearchDevice/CudaKeySearchDevice.cu`**: **核心部分**。包含 CUDA Kernel 代码（如 `keyFinderKernel`），执行具体的哈希和点加法逻辑。
+*   **`cudaMath/`**: 包含在 GPU 上运行的数学库实现（SHA256, RIPEMD160, secp256k1 数学运算）。
+*   **`AddressUtil` & `CmdParse`**: 辅助工具，用于处理地址格式转换和参数解析。
+
+
+KeyFinder 命令行使用说明（详细版）
+
+一、概述
+- KeyFinder 是一个在给定密钥空间内搜索私钥的工具，针对一组目标地址（TARGETS）进行匹配，支持 CUDA 设备加速、断点续跑、输出结果保存与多种压缩模式。
+- 结果可输出到控制台，或使用 -o/--out 将结果追加写入到指定文件。
+
+二、基本用法
+- 显示帮助：
+  KeyFinder.exe --help
+- 列出可用设备（设备 ID）：
+  KeyFinder.exe --list-devices
+- 从文件读取目标地址并将结果保存：
+  KeyFinder.exe -i addresses.txt -o results.txt
+- 在命令行直接指定目标地址（可多个），指定设备、块/线程/每线程点数：
+  KeyFinder.exe -d 0 -b 32 -t 256 -p 32 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa
+- 指定密钥空间与压缩模式：
+  KeyFinder.exe --keyspace 1:+100000 --compression BOTH -i addresses.txt -o found.txt
+
+三、命令行参数一览
+- --help
+  打印帮助信息并退出。
+- -c, --compressed
+  使用压缩公钥（与 -u/--uncompressed 互斥）。默认压缩。
+- -u, --uncompressed
+  使用未压缩公钥。
+- --compression MODE
+  明确指定压缩模式，MODE 可取：COMPRESSED、UNCOMPRESSED、BOTH。
+  BOTH 表示同时匹配压缩与未压缩形式。
+- -d, --device ID
+  使用指定 ID 的设备（先用 --list-devices 查看列表）。
+- -b, --blocks N
+  CUDA 网格中的 blocks 数量（默认 32）。
+- -t, --threads N
+  每个 block 的 threads 数量（默认 256）。
+- -p, --points N
+  每线程处理的点数（默认 32）。
+- -i, --in FILE
+  从文件读取目标地址，一行一个。未指定且命令行也未提供地址时，将尝试当前目录下的 addresses.txt。
+- -o, --out FILE
+  将找到的结果写入 FILE（追加写入，文件不存在会创建；需确保目录存在）。
+- -f, --follow
+  使用“换行跟随”的状态输出（适合日志尾随）。默认用“回车覆盖”同一行。
+- -r, --random
+  启用随机扫描模式：不总是从同一位置顺序开始，而是在设备内部从一个“随机批次”起步，达到非单一顺序扫描的效果。仅在非续跑（未从检查点恢复）时生效。
+- --random-windows
+  开启随机窗口模式：在完整密钥空间上反复抽取随机窗口（约 24e9 个密钥，假设 400MKey/s×60s），扫描完成后再抽取下一窗口。配合 CUDA 设备的“rebase”可在窗口切换时避免重新生成起始点，大幅降低切换延迟。
+- --list-devices
+  列出所有可用设备与基本信息，然后退出。
+- --keyspace KEYSPACE
+  指定搜索密钥空间（十六进制）。支持以下格式：
+  • START:END
+  • START:+COUNT（从 START 开始，搜索 COUNT 个）
+  • START（等价于 START:END，其中 END 默认为 N-1）
+  • :END（从 1 到 END）
+  • :+COUNT（从 1 开始，搜索 COUNT 个）
+- --stride N
+  步长，每次递增的私钥数（十六进制）。默认 1。
+- --share M/N
+  将当前密钥空间平均分为 N 份，仅处理第 M 份（1-based）。适用于多机并行切分任务。
+- --continue FILE
+  使用断点文件保存/加载进度（运行中会周期性保存，重启时可从该文件继续）。
+
+四、目标地址输入
+- 两种方式提供 TARGETS：
+  1) 直接作为命令行操作数（空格分隔，可多个）。程序会逐个校验格式（无效地址会报错并退出）。
+  2) 用 -i/--in 从文件读取，一行一个地址。
+- 若未提供任何地址，程序会尝试读取当前工作目录下的 addresses.txt；若也不存在则报错并显示用法。
+
+五、输出结果
+- 未指定 -o/--out 时：只打印到控制台，不写文件。
+- 指定 -o/--out FILE 时：每次找到匹配会立即追加写入 FILE，并打印“Written to 'FILE'”提示。
+- 写入行的格式：
+  地址 私钥(十六进制) 公钥字符串
+  其中公钥字符串的压缩/未压缩形式与当前 compression 设置一致。
+- 注意：
+  • 使用相对路径时，文件会写到“程序启动时的工作目录”。建议使用绝对路径避免混淆。
+  • 目标目录必须存在，程序不会创建目录；若目录不存在将无法写入。
+  • 避免输出到无写权限路径（如 Program Files）；推荐写到用户目录（桌面/文档）。
+
+六、密钥空间与步长
+- 默认起始密钥为 1，结束密钥为 secp256k1 的阶 N-1。
+- --keyspace 可精确控制起止或数量；--stride 指定递增步幅。
+- 示例：
+  • 从 1 搜到 1FFFF（含）：--keyspace 1:1FFFF
+  • 从起点 1000 开始搜 100000 个：--keyspace 1000:+100000
+  • 以步长 10 搜：--stride A
+
+七、压缩模式
+- 通过以下方式设定压缩模式：
+  • -c 或 --compressed（压缩）
+  • -u 或 --uncompressed（未压缩）
+  • --compression COMPRESSED|UNCOMPRESSED|BOTH
+- 当使用 BOTH 时，将同时匹配两种形式，适合不确定目标是否使用压缩公钥的场景。
+
+八、设备与性能参数
+- 先执行：KeyFinder.exe --list-devices，记下设备 ID；再用 -d/--device 指定。
+- 默认参数：threads=256，blocks=32，points=32。可用 -t/-b/-p 覆盖。
+- 这些参数会影响吞吐与显存占用，建议从默认值开始，根据设备情况再调优。
+
+九、断点续跑（Checkpoint）
+- 使用 --continue FILE 开启断点功能：
+  • 运行期间会定期将进度写入该文件，包含 start/next/end/blocks/threads/points/compression/device/elapsed/stride 等字段。
+  • 下次运行时若指定同一文件，将从文件中的 next 继续搜索。
+- 与随机/随机窗口模式的关系：
+  • 当实际从检查点文件恢复（文件存在且被成功读取）时，即使命令行带了 -r/--random 或 --random-windows，也会自动忽略“随机起步/随机窗口”的首次随机化，确保续跑的确定性与可重复性。
+  • 首次运行（无有效检查点）时 -r/--random 与 --random-windows 才会生效。
+
+十、运行示例
+- 示例 1：最简运行（用默认 addresses.txt）
+  KeyFinder.exe -o C:\Users\frank\Desktop\found.txt
+- 示例 2：指定设备 0，压缩公钥，给定地址文件
+  KeyFinder.exe -d 0 -c -i C:\data\targets.txt -o C:\data\results.txt
+- 示例 3：指定密钥空间和步长，未压缩输出，追踪模式
+  KeyFinder.exe --keyspace 1ABCDE:+100000 --stride 5 -u -i targets.txt -o results.txt -f
+- 示例 4：多机/多实例分片
+  机器 A（第 1 份）：KeyFinder.exe --share 1/4 --keyspace 1:+1000000 -i targets.txt -o a.txt
+  机器 B（第 2 份）：KeyFinder.exe --share 2/4 --keyspace 1:+1000000 -i targets.txt -o b.txt
+- 示例 5：断点续跑
+  首次：KeyFinder.exe --continue C:\data\checkpoint.txt -i targets.txt -o results.txt
+  继续：KeyFinder.exe --continue C:\data\checkpoint.txt -i targets.txt -o results.txt
+- 示例 6：随机模式（非续跑时生效）
+  KeyFinder.exe -r -i addresses.txt --keyspace 1:+100000 -o results.txt
+- 示例 7：随机窗口模式（CUDA rebase 加速窗口切换）
+  KeyFinder.exe --random-windows -d 0 -b 32 -t 256 -p 32 -i addresses.txt -c
+
+十一、状态输出与日志
+- 状态输出包含：设备名、显存使用、目标数、速度（MKey/s）、累计总量、累计时间等。
+- -f/--follow 开启换行跟随，便于日志采集；默认采用回车覆盖同一行。
+- 当发现匹配：
+  • 若指定了 -o，会打印“Found key ... Written to 'FILE'”，并将结果写入 FILE。
+  • 若未指定 -o，只打印详细信息到控制台。
+
+十二、常见问题与排查
+- 找到匹配但没有结果文件：
+  • 是否使用了 -o/--out？未指定则只打印到控制台。
+  • 是否使用了相对路径且找错目录？建议用绝对路径。
+  • 目标目录是否存在？程序不会创建目录。
+  • 是否有写权限？尽量写到用户目录。
+- 没有目标地址：
+  • 未提供操作数也未指定 -i 时，程序会尝试 addresses.txt；若不存在则报错。
+- 设备不存在：
+  • 用 --list-devices 先确认 ID；若 ID 不存在会报错退出。
+
+十三、返回码
+- 0：成功执行并结束
+- 1：参数错误、设备不可用、文件不可读/可写失败、设备初始化或运行异常等
+
+附注
+- 建议在命令中使用绝对路径，避免工作目录带来的混淆。
+- Windows 下路径示例：C:\\Users\\你的用户名\\Desktop\\results.txt。
+
+十四、环境准备与 CUDA 版本（重要）
+- NVIDIA 驱动：需满足所安装 CUDA Toolkit 的最低驱动要求（一般新驱动向下兼容老 CUDA）。
+- 安装 CUDA Toolkit：
+  • Linux：默认安装在 /usr/local/cuda-<版本>，通常会有 /usr/local/cuda 指向当前版本。
+  • Windows：默认安装在 C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v<版本>。
+- 验证 nvcc：nvcc --version
+- 设置 CUDA_HOME（若未使用默认路径）：
+  • Linux：导出 CUDA_HOME=/usr/local/cuda-12.2，并确保 PATH/LD_LIBRARY_PATH 包含 $CUDA_HOME/bin 与 $CUDA_HOME/lib64。
+  • Windows（MSVC 构建）：安装 Visual Studio Build Tools 与 CUDA VS 集成；或使用 WSL/Ubuntu 通过 Makefile 构建。
+
+十五、按 GPU 选择 COMPUTE_CAP（计算能力）
+- 需在构建时设置与显卡匹配的计算能力号，以获得正确的 SM 架构支持：
+  • Pascal（GTX 10 系列，P100 等）：COMPUTE_CAP=61
+  • Turing（RTX 20/T4）：COMPUTE_CAP=75
+  • Ampere：
+    - 数据中心 A100：COMPUTE_CAP=80
+    - GeForce RTX 30（GA10x）：COMPUTE_CAP=86
+  • Ada Lovelace（RTX 40）：COMPUTE_CAP=89
+- 顶层 Makefile 默认 COMPUTE_CAP=89，可在命令行覆盖。
+
+十六、构建命令示例（按 CUDA 版本/GPU 调整）
+- Linux（推荐）：
+  1) 清理：make clean
+  2) 常规（CUDA 默认路径）：make BUILD_CUDA=1 COMPUTE_CAP=86 -j$(nproc)
+  3) 非默认路径（例如 CUDA 12.2）：make BUILD_CUDA=1 COMPUTE_CAP=86 CUDA_HOME=/usr/local/cuda-12.2 -j$(nproc)
+  4) 查看产物：bin/cuKeyFinder
+- Windows：
+  • 使用 VS 方案（需安装相匹配的 CUDA VS 集成）：
+    MSBuild KeyFinder.sln /p:Configuration=Release
+  • 若提示找不到 CUDA *.props/Targets：请安装与本机 CUDA 版本匹配的 VS 集成，或改用 WSL/Ubuntu 按 Linux 方式构建。
+
+十七、运行命令示例（汇总）
+- 列设备：
+  ./bin/cuKeyFinder --list-devices
+- 随机窗口模式（rebase 快速切换窗口）：
+  ./bin/cuKeyFinder --random-windows -d 0 -b 32 -t 256 -p 32 -i addresses.txt -c
+- 非随机小范围冒烟：
+  ./bin/cuKeyFinder --keyspace 1:+100000 -d 0 -b 32 -t 256 -p 32 -i addresses.txt -c
+
+十八、常见构建错误与解决
+- nvcc: command not found / 找不到 cuda.h：
+  • 确认已安装 CUDA Toolkit；设置 CUDA_HOME，并将 $CUDA_HOME/bin 加入 PATH、$CUDA_HOME/lib64 加入 LD_LIBRARY_PATH（Linux）。
+  • Windows：确认安装 CUDA VS 集成（或使用 WSL 构建）。
+- 无法找到 CUDA *.props（Windows）：
+  • 安装对应版本的 CUDA VS 集成，或改用 Linux Makefile 构建流程。
+- 链接报找不到 cudart/cudadevrt：
+  • 确认顶层 Makefile 传入的 CUDA_LIB 正确（通常是 $CUDA_HOME/lib64），并在链接选项中包含 -lcudart -lcudadevrt。
+
+十九、性能调优建议
+- 参数影响：
+  • 总并行点数 totalPoints = blocks × threads × pointsPerThread。
+  • 设备侧缓存占用约 totalPoints × 40 字节（来源于起始点缓存），显存紧张时可适当降低 pointsPerThread。
+- 起始建议：blocks=32，threads=256，points=32；
+  高端 GPU 可尝试增加 blocks（如 64）或 threads（如 512）以提升并行度。
+- stride：步长越大，逻辑上跳过的密钥越多；通常保持 1，除非有特殊分片/并行策略。
+
+二十、随机窗口模式与 rebase 说明
+- 首个窗口会进行一次完整初始化（生成起始点并下发设备）。
+- 后续窗口通过在设备上对缓存点做“就地平移”（rebase），快速切换到新窗口起点，避免重复初始化的开销。
+- 状态输出中 nextKey 会与“Starting at”保持一致；窗口切换日志会显示新的起止范围。
+
+
+附录 A：Ubuntu 适配与最佳实践
+
+A.1 快速开始（Ubuntu）
+- 前置检查：
+  nvidia-smi   # 显卡与驱动
+  nvcc --version   # CUDA 版本
+  make --version; g++ --version   # 构建工具链
+- 构建：
+  make clean && make BUILD_CUDA=1 COMPUTE_CAP=<你的GPU计算能力> -j$(nproc)
+  # 例如：Ampere/RTX 30 → 86，Ada/RTX 40 → 89，Turing/RTX 20 → 75
+- 运行：
+  ./bin/cuKeyFinder --list-devices
+  ./bin/cuKeyFinder --random-windows -d 0 -b 32 -t 256 -p 32 -i addresses.txt -c -o /home/$USER/results.txt
+
+A.2 环境安装（Ubuntu）
+- 基础依赖：
+  sudo apt update && sudo apt install -y build-essential make git pkg-config
+- 驱动（推荐）：
+  sudo ubuntu-drivers autoinstall  # 自动选择
+  # 或：sudo apt install -y nvidia-driver-535
+- CUDA Toolkit 安装：
+  方式1：sudo apt install -y nvidia-cuda-toolkit   # 版本可能偏旧
+  方式2：从 NVIDIA 官网安装 .run/.deb（推荐获取较新版本）
+- 环境变量（如非默认 /usr/local/cuda）：
+  echo 'export CUDA_HOME=/usr/local/cuda' >> ~/.bashrc
+  echo 'export PATH="$CUDA_HOME/bin:$PATH"' >> ~/.bashrc
+  echo 'export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH}"' >> ~/.bashrc
+  source ~/.bashrc
+- 验证：
+  nvidia-smi && nvcc --version
+
+A.3 构建参数与产物
+- 计算能力（COMPUTE_CAP）速查：Pascal=61，Turing=75，Ampere(A100=80/RTX30=86)，Ada=89
+- 推荐构建：
+  make clean && make BUILD_CUDA=1 COMPUTE_CAP=86 -j$(nproc)
+- 可执行文件位置：
+  ./bin/cuKeyFinder
+
+A.4 运行与输出（Ubuntu）
+- 目标地址：默认读取项目根目录的 addresses.txt；也可通过 -i FILE 指定。
+- 输出文件：强烈建议使用绝对路径，例如：
+  -o /home/$USER/results.txt  # 确保目录存在且可写
+- 示例：
+  ./bin/cuKeyFinder --keyspace 1:+100000 -d 0 -b 32 -t 256 -p 32 -i addresses.txt -c -o /home/$USER/results.txt
+- 随机窗口模式（rebase 加速）：
+  ./bin/cuKeyFinder --random-windows -d 0 -b 32 -t 256 -p 32 -i addresses.txt -c -o /home/$USER/results.txt
+
+A.5 常见问题（Ubuntu）
+- nvcc: command not found / 找不到 cuda.h：
+  安装 CUDA Toolkit；设置 CUDA_HOME=/usr/local/cuda，并把 $CUDA_HOME/bin、$CUDA_HOME/lib64 加入 PATH/LD_LIBRARY_PATH。
+- 链接找不到 cudart/cudadevrt：
+  确认 /usr/local/cuda/lib64 在 LD_LIBRARY_PATH 中，必要时在 /etc/ld.so.conf.d/cuda.conf 添加并执行 sudo ldconfig。
+- 没有 Makefile/没有目标：
+  确保当前目录是项目根目录（包含顶层 Makefile），用 pwd 检查。
+- 权限问题：
+  输出目录需存在且可写，建议放在 /home/$USER 下。
+
+A.6 后台运行与日志
+- 后台运行并保存日志：
+  nohup ./bin/cuKeyFinder --random-windows -d 0 -b 32 -t 256 -p 32 -i addresses.txt -c -o /home/$USER/results.txt > /home/$USER/cuKeyFinder.log 2>&1 &
+  tail -f /home/$USER/cuKeyFinder.log
+- 同步打印与写文件：
+  ./bin/cuKeyFinder --random-windows -d 0 -b 32 -t 256 -p 32 -i addresses.txt -c | tee /home/$USER/cuKeyFinder.log
+- 断点续跑：
+  首次：./bin/cuKeyFinder --continue /home/$USER/checkpoint.txt -i addresses.txt -o /home/$USER/results.txt
+  续跑：./bin/cuKeyFinder --continue /home/$USER/checkpoint.txt -i addresses.txt -o /home/$USER/results.txt
+
+A.7 性能调优（Ubuntu）
+- 起始建议：-b 32 -t 256 -p 32；高端 GPU 可尝试提升 blocks/threads。
+- 显存估算：blocks × threads × points × ~40 字节；显存不足优先降低 points。
+- --random-windows 通过设备侧 rebase 降低窗口切换延迟，减少重复初始化成本。
