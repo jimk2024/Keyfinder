@@ -1,0 +1,169 @@
+XorFilter 使用文档
+
+概述
+- 本工具链包含两个部分：
+  1) XorFilterBuilder：从目标列表构建 XOR filter（xor8/xor12/xor16），输出 .xorflt 文件
+  2) XorFilter::Reader（KeyFinderLib 内）：读取 .xorflt，并提供 mightContain 查询接口
+- 典型用途：在 KeyFinder 的扫描过程中，用 XOR filter 快速判定 hash160 是否属于目标集合，从而大幅减少后续开销
+
+一、环境与构建
+- 依赖：make/g++（或 MSYS2/MinGW、WSL 等），CUDA 相关组件仅对 CUDA 模块有要求（与本工具无关）
+- 根目录提供了统一的 Makefile，已集成 XorFilterBuilder 与 KeyFinderLib
+- 仅构建 XorFilterBuilder：
+  - Linux/WSL：在仓库根目录执行
+    make dir_xorfilterbuilder
+  - Windows（MSYS2 MinGW）：在 MSYS2 MinGW 终端执行
+    mingw32-make dir_xorfilterbuilder
+- 成功后，可执行文件位于 bin/xorfilterbuilder
+
+二、输入文件格式（targets.txt）
+- 每行一条目标，支持以下格式：
+  - 比特币 Base58 地址，例如：1BoatSLRHtKNngkdXEeobR76b53LETtpyT
+  - 40 字节十六进制的 hash160，例如：010203...（总长 40 个十六进制字符）
+  - 压缩公钥十六进制（33 字节，前缀 02/03），例如：02abcdef...（总长 66 个十六进制字符）
+  - 非压缩公钥十六进制（65 字节，前缀 04），例如：04abcdef...（总长 130 个十六进制字符）
+- 支持空行与以 # 开头的注释行
+- 自动去重。最终集合会按唯一 hash160 统计
+
+三、XorFilterBuilder 使用
+- 命令行参数：
+  - -i, --in <path>：输入目标文件（必需）
+  - --out <path>：输出 .xorflt 文件（默认 targets.xorflt）
+  - --sorted-out <path>：可选，输出排序后的二进制 hash160 列表（每项 20 字节）
+  - --fbits <N>：指纹位数，支持 8/12/16（以及 9–15 也可，内部以 16 位槽存放），默认 8
+  - --seed <N>：构建随机种子，默认 0xcbf29ce484222325
+- 自动重试逻辑：
+  - 初始数组长度 m ≈ ceil(n × 1.23)，每个长度最多尝试 24 个不同 seed
+  - 若失败则按 1.10 增长容量，最多增长 8 次；若仍失败则报错退出
+  - 构建成功会输出最终 seed 与数组长度
+
+四、示例命令行
+1) 最小示例（默认 xor8）
+   bin/xorfilterbuilder -i addresses.txt --out targets.xorflt
+
+2) 指定 fbits 与 seed，并同时导出排序后的 hash160 二进制
+   bin/xorfilterbuilder -i addresses.txt --out targets.xorflt --sorted-out targets.h160s --fbits 8 --seed 123456
+
+3) 输入混合多种格式（Base58/哈希/公钥）
+   bin/xorfilterbuilder -i mixed_targets.txt --out mixed.xorflt --fbits 12
+
+4) Windows（MSYS2 MinGW）典型路径（假设当前目录为项目根）
+   ./bin/xorfilterbuilder -i ./addresses.txt --out ./bin/targets.xorflt --fbits 8
+
+五、输出文件说明
+- .xorflt 文件结构（小端）：
+  - magic: uint32 = 0x584F5246 ('XORF')
+  - version: uint32 = 1
+  - fbits: uint32
+  - seed: uint64
+  - count: uint64   （目标数量）
+  - arrlen: uint64  （指纹数组长度）
+  - 指纹数组：
+    - 若 fbits <= 8：逐元素写入 uint8
+    - 若 fbits > 8：逐元素写入 uint16（以 (1<<fbits)-1 截断）
+- 校验大小的经验值：
+  - 文件大小 ≈ 32 字节头 + arrlen × bytes_per_fp
+  - bytes_per_fp = (fbits <= 8 ? 1 : 2)
+
+- --sorted-out 文件：
+  - 按升序写出所有 hash160 原始字节（每项 20 字节）
+
+六、日志与调优
+- 日志关键行：
+  - XOR build success with seed=..., arrayLength=...
+  - retry seeds... / increasing size factor ... 说明正在重试或扩容
+- 调优建议：
+  - fbits 越大，误判率越低但内存/磁盘越大；常用 8 或 12
+  - 若构建失败较多，可尝试：
+    - 增大 fbits（10/12）
+    - 或直接采用更大的初始集合（增加输入条目），通常无需手动，因为会自动扩容与换 seed 重试
+
+七、在 KeyFinder 中使用 Reader（编程接口）
+- 头文件：KeyFinderLib/XorFilter.h
+- 类：XorFilter::Reader
+- 典型用法（伪代码）：
+  Reader r;
+  r.load("targets.xorflt");
+  unsigned int h[5] = {...}; // 某处计算出的 hash160（5×uint32）
+  if (r.mightContain(h)) {
+      // 可能命中（not false positive-free）。可继续更重的后续校验
+  }
+- Reader 的哈希与索引算法与构建端保持完全一致，确保构建/查询对齐
+- KeyFinderLib 的 Makefile 已使用通配符自动包含 XorFilter.cpp，因此直接 make 即会编入 libkeyfinder.a
+
+八、故障排查
+- 运行提示找不到 make/g++：
+  - Windows 建议安装 MSYS2/MinGW 或使用 WSL；Linux/WSL 请确保已安装 build-essential
+- XorFilterBuilder 运行时报错 invalid entry：
+  - 检查该行是否为支持的格式（Base58、40-hex hash160、02/03 压缩公钥、04 非压缩公钥）
+- XorFilter::Reader 加载失败：
+  - 检查 .xorflt 是否由本工具生成、是否完整写入，或是否被误编辑
+
+九、常见问答
+- 是否支持 8/12/16 以外的 fbits？
+  - 是，9–15 也可以，内部以 16 位槽存储并按 mask 截断
+- 是否有跨平台二进制兼容性？
+  - 头部与数组均按本机端序序列化，目前在小端平台（Windows/Linux x86_64）一致；跨端序平台共享时需注意
+
+十、与 KeyFinder 主程序命令行对接（从命令行加载 .xorflt）
+
+目的
+- 通过在 KeyFinder 主程序新增开关 --xorflt FILE，从命令行直接加载预构建的 .xorflt，用于在扫描流程中快速预筛 hash160。
+- 保持与现有 --in FILE（按行读取地址/公钥/哈希）的兼容，可单独使用或组合使用。
+
+当前状态说明
+- 目前主程序已含 --in、--out、--random 等参数，但尚未内置 --xorflt 开关；XorFilter::Reader 已在 KeyFinderLib 中提供，可直接被主程序调用。
+- 如果你运行时提示“未识别的选项 --xorflt”，说明可执行程序尚未完成此对接，请参考下方“开发者集成指南”或告知我直接提交改动。
+
+推荐命令行接口（对接完成后）
+- --xorflt FILE         从 FILE 加载 .xorflt 文件（包括 fbits/seed/数组长度等元数据）
+- --xorflt-only         仅使用 .xorflt 作为目标集合（忽略 --in）；不指定时默认“合并模式”：--in 与 --xorflt 的目标并集
+
+示例命令行（对接完成后）
+1) 仅使用 .xorflt 进行 GPU 扫描（典型）
+   KeyFinder\cuKeyFinder.bin -d 0 -b 256 -t 256 -p 256 --xorflt bin/targets.xorflt --xorflt-only
+
+2) 使用 .xorflt + 文本目标并集（适合增量/追加少量新目标）
+   KeyFinder\cuKeyFinder.bin --xorflt bin/targets.xorflt -i addresses.txt -d 0 -b 256 -t 256 -p 256
+
+3) 搭配随机窗口扫描（降低热区偏置）
+   KeyFinder\cuKeyFinder.bin --xorflt bin/targets.xorflt --random-windows -d 0
+
+4) Windows（MSYS2 MinGW）终端中的典型路径写法
+   ./KeyFinder/cuKeyFinder.bin --xorflt ./bin/targets.xorflt -d 0 -b 256 -t 256 -p 256
+
+运行期行为与建议
+- 加载成功后，程序启动日志中应出现：Loaded xor filter: fbits=..., seed=..., count=..., arrayLength=...
+- 误判控制：fbits 越大误判率越低。建议在构建阶段选择 8 或 12；查询端无需额外参数。
+- 当同时指定 --in 与 --xorflt（非 --xorflt-only），建议在匹配流程中对“--in 目标集”走原有精确匹配，对“额外 key 候选”先用 Reader.mightContain 预筛后再进行精确校验。
+
+常见问题
+- 报错“未识别的选项 --xorflt”：说明可执行尚未集成该参数，请按下节集成或让我代为修改。
+- 指定了 --xorflt 但实际命中过少/过多：确认 .xorflt 与你的目标集匹配，避免不同版本或错误的输入集合。
+
+开发者集成指南（简要）
+1) 注册命令行参数
+   - 在 KeyFinder/mai n.cpp 使用 CmdParse 增加：parser.add("", "--xorflt", true) 与可选 parser.add("", "--xorflt-only", false)
+   - 在参数分发处读取路径，例如 xorfltPath
+
+2) 加载过滤器
+   - 在主程序初始化阶段包含头文件：KeyFinderLib/XorFilter.h
+   - 创建实例：XorFilter::Reader reader; reader.load(xorfltPath);
+   - 将 reader 的只读引用/指针传递到执行搜索的路径（CPU/GPU 侧），供查询使用
+
+3) 查询接入点（思路）
+   - 计算出当前候选公钥的 hash160（5×uint32 或 hash160 结构体）
+   - 若启用 --xorflt：先调用 reader.mightContain(h)
+     - false：直接跳过
+     - true：继续进行现有的精确匹配/比对流程（避免漏报）
+   - --xorflt-only：可跳过 --in 所生成的目标集装载与精确匹配步骤，仅保留必要的末端校验
+
+4) 并发与线程安全
+   - Reader 仅在启动时 load，运行时只读查询，可在多线程间安全共享（避免复制大数组）
+
+5) 记录日志
+   - 成功加载后打印：fbits/seed/count/arrayLength 以及文件路径；有助于在运行时确认加载的过滤器与预期一致
+
+临时替代方案（未对接前）
+- 继续使用 --in FILE 走原有流程（按行读取地址/公钥/哈希），不使用 .xorflt
+- 如需我直接完成对接与提交构建规则，请告知偏好（Makefile 或 VS），我将补上代码与编译目标
